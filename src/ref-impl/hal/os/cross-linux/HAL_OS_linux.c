@@ -348,9 +348,10 @@ int HAL_GetDeviceSecret(_OU_ char *device_secret)
     #endif
  *
  */
+#include "iot_config.h"
 int HAL_GetFirmwareVersion(_OU_ char *version)
 {
-    char *ver = "app-2.1.22-20190214.1000";
+    char *ver = IOT_VERSION ;
     int len = strlen(ver);
     memset(version, 0x0, FIRMWARE_VERSION_MAXLEN);
 #ifdef __DEMO__
