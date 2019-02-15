@@ -22,26 +22,41 @@
 #define TOPIC_UPDATE            "/"PRODUCT_KEY"/"DEVICE_NAME"/user/update"
 #define TOPIC_ERROR             "/"PRODUCT_KEY"/"DEVICE_NAME"/user/update/error"
 #define TOPIC_GET               "/"PRODUCT_KEY"/"DEVICE_NAME"/user/get"
+
+/*
+主题订阅一次即可，无需重复订阅，重启程序不用重新订阅
+*/
+//该主题用来进行 云端Pub的消息通信
 #define TOPIC_DATA              "/"PRODUCT_KEY"/"DEVICE_NAME"/user/data"
 
+//该主题用来进行 云端PubBroadcast的消息通信
 #define TOPIC_BOARDCAST_DATA              "/broadcast/"PRODUCT_KEY"/test1"
 
 #define MQTT_MSGLEN             (1024)
 
-static void *g_thread_yield = NULL;
-static void *g_thread_sub_unsub_1 = NULL;
-static void *g_thread_sub_unsub_2 = NULL;
+
+// rrpc
+#define TOPIC_RRPC_REQ       "/sys/"PRODUCT_KEY"/"DEVICE_NAME"/rrpc/request/"
+#define TOPIC_RRPC_RSP       "/sys/"PRODUCT_KEY"/"DEVICE_NAME"/rrpc/response/"
+#define RRPC_MQTT_MSGLEN    (1024)
+#define MSG_ID_LEN_MAX      (64)
+#define TOPIC_LEN_MAX       (1024)
+
+
+//mqtt 连接变量
+static void *pclient;
+
+
 static void *g_thread_pub_1 = NULL;
 static void *g_thread_pub_2 = NULL;
 
-static void *g_thread_rrpc = NULL;
+static void *g_thread_do_subscribes = NULL;
 
-static int g_thread_yield_running = 1;
-static int g_thread_sub_unsub_1_running = 1;
-static int g_thread_sub_unsub_2_running = 1;
 static int g_thread_pub_1_running = 1;
 static int g_thread_pub_2_running = 1;
-static int g_thread_rrpc_running = 1;
+
+
+static int g_while_yield_running = 1;
 
 #define EXAMPLE_TRACE(fmt, ...)  \
     do { \
@@ -50,7 +65,7 @@ static int g_thread_rrpc_running = 1;
         HAL_Printf("%s", "\r\n"); \
     } while(0)
 
-
+//用来监听一些阿里iot自带的系统topic，比如控制台上的延迟检测
 void event_handle(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
 {
     uintptr_t packet_id = (uintptr_t)msg->msg;
@@ -119,7 +134,8 @@ void event_handle(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
     }
 }
 
-static void _demo_message_arrive(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
+//监听 data主题 和 broadcast 主题的消息。
+static void mqtt_message_arrive(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
 {
     iotx_mqtt_topic_info_pt ptopic_info = (iotx_mqtt_topic_info_pt) msg->msg;
 
@@ -136,97 +152,134 @@ static void _demo_message_arrive(void *pcontext, void *pclient, iotx_mqtt_event_
     EXAMPLE_TRACE("----");
 }
 
-void *thread_subscribe1(void *pclient)
+
+//处理rrpc主题发送来的消息，并回复
+void mqtt_rrpc_msg_arrive(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
+{
+	iotx_mqtt_topic_info_pt     ptopic_info = (iotx_mqtt_topic_info_pt) msg->msg;
+	uintptr_t packet_id = (uintptr_t)msg->msg;
+	switch (msg->event_type) {
+
+
+		case IOTX_MQTT_EVENT_SUBCRIBE_SUCCESS:
+			EXAMPLE_TRACE("subscribe success, packet-id=%u", (unsigned int)packet_id);
+			break;
+
+		case IOTX_MQTT_EVENT_SUBCRIBE_TIMEOUT:
+			EXAMPLE_TRACE("subscribe wait ack timeout, packet-id=%u", (unsigned int)packet_id);
+			break;
+
+		case IOTX_MQTT_EVENT_SUBCRIBE_NACK:
+			EXAMPLE_TRACE("subscribe nack, packet-id=%u", (unsigned int)packet_id);
+			break;
+		case IOTX_MQTT_EVENT_PUBLISH_RECEIVED:
+		{	 
+			iotx_mqtt_topic_info_t      topic_msg;
+			char                        msg_pub[RRPC_MQTT_MSGLEN] = {0};
+			char                        topic[TOPIC_LEN_MAX] = {0};
+			char                        msg_id[MSG_ID_LEN_MAX] = {0};
+
+			/* print topic name and topic message */
+			EXAMPLE_TRACE("----\n");
+			EXAMPLE_TRACE("Topic: '%.*s' (Length: %d)\n",
+					ptopic_info->topic_len,
+					ptopic_info->ptopic,
+					ptopic_info->topic_len);
+			EXAMPLE_TRACE("Payload: '%.*s' (Length: %d)\n",
+					ptopic_info->payload_len,
+					ptopic_info->payload,
+					ptopic_info->payload_len);
+			EXAMPLE_TRACE("----\n");
+
+			if (snprintf(msg_id,
+						ptopic_info->topic_len - strlen(TOPIC_RRPC_REQ) + 1,
+						"%s",
+						ptopic_info->ptopic + strlen(TOPIC_RRPC_REQ))
+					> sizeof(msg_id)) {
+				EXAMPLE_TRACE("snprintf error!\n");
+				return;
+			}
+
+			EXAMPLE_TRACE("response msg_id = %s\n", msg_id);
+			if (snprintf(topic, sizeof(topic), "%s%s", TOPIC_RRPC_RSP, msg_id) > sizeof(topic)) {
+				EXAMPLE_TRACE("snprintf error!\n");
+				return;
+			}
+			EXAMPLE_TRACE("response topic = %s\n", topic);
+
+			sprintf(msg_pub, "rrpc client has received message!\n");
+			topic_msg.qos = IOTX_MQTT_QOS0;
+			topic_msg.retain = 0;
+			topic_msg.dup = 0;
+			topic_msg.payload = (void *)msg_pub;
+			topic_msg.payload_len = strlen(msg_pub);
+
+			if (IOT_MQTT_Publish(pclient, topic, &topic_msg) < 0) {
+				EXAMPLE_TRACE("error occur when publish!\n");
+			}
+
+			break;
+		}
+		case IOTX_MQTT_EVENT_BUFFER_OVERFLOW:
+			EXAMPLE_TRACE("buffer overflow, %s", msg->msg);
+			break;
+
+		default:
+			EXAMPLE_TRACE("Should NOT arrive here.");
+			break;
+
+	}
+
+}
+
+
+
+
+int do_subscribes(void *pclient)
 {
     int     ret = -1;
-
-    ret = IOT_MQTT_Subscribe(pclient, TOPIC_BOARDCAST_DATA, IOTX_MQTT_QOS1, _demo_message_arrive, NULL);
+    //订阅主题 data
+    ret = IOT_MQTT_Subscribe(pclient, TOPIC_BOARDCAST_DATA, IOTX_MQTT_QOS1, mqtt_message_arrive, NULL);
     if (ret < 0) {
 	    EXAMPLE_TRACE("subscribe error");
-	    return NULL;
+	    return -1;
     }
 
+    HAL_SleepMs(1000);
    
-    ret = IOT_MQTT_Subscribe(pclient, TOPIC_DATA, IOTX_MQTT_QOS1, _demo_message_arrive, NULL);
+    //订阅主题 boardcast
+    ret = IOT_MQTT_Subscribe(pclient, TOPIC_DATA, IOTX_MQTT_QOS1, mqtt_message_arrive, NULL);
     if (ret < 0) {
 	    EXAMPLE_TRACE("subscribe error");
-	    return NULL;
+	    return -1;
     }
-    return NULL;
 
-    while (g_thread_sub_unsub_1_running) {
-        HAL_SleepMs(1000);
-        ret = IOT_MQTT_Subscribe(pclient, TOPIC_DATA, IOTX_MQTT_QOS1, _demo_message_arrive, NULL);
-        if (ret < 0) {
-            EXAMPLE_TRACE("subscribe error");
-            return NULL;
-        }
-        HAL_SleepMs(2000);
-/*
-        ret = IOT_MQTT_Unsubscribe(pclient, TOPIC_GET);
-        if (ret < 0) {
-            EXAMPLE_TRACE("subscribe error");
-            return NULL;
-        }
-*/
-        HAL_SleepMs(1000);
+
+    /* Subscribe the specific topic */
+    ret = IOT_MQTT_Subscribe(pclient, TOPIC_RRPC_REQ "+", IOTX_MQTT_QOS0, mqtt_rrpc_msg_arrive, NULL);
+    if (ret < 0) {
+        EXAMPLE_TRACE("IOT_MQTT_Subscribe failed, rc = %d\n", ret);
+        return -1;
     }
-    return NULL;
+
+    if(g_thread_do_subscribes)
+	    HAL_ThreadDelete(g_thread_do_subscribes); //必须线程已经起来了，不然执行这个函数会出现程序崩溃
+
+    return 0;
 }
 
-void *thread_subscribe2(void *pclient)
+int do_unsubscribe(void *pclient)
 {
-    int     ret = -1;
-
-    return NULL;
-    while (g_thread_sub_unsub_2_running) {
-        HAL_SleepMs(1000);
-/*
-        ret = IOT_MQTT_Unsubscribe(pclient, TOPIC_DATA);
-        if (ret < 0) {
-            EXAMPLE_TRACE("subscribe error");
-            return NULL;
-        }
-*/
-        HAL_SleepMs(1000);
-        ret = IOT_MQTT_Subscribe_Sync(pclient, TOPIC_GET, IOTX_MQTT_QOS1, _demo_message_arrive, NULL, 500);
-        if (ret < 0) {
-            EXAMPLE_TRACE("subscribe error");
-            return NULL;
-        }
-        HAL_SleepMs(1000);
-    }
-    return NULL;
+	int     ret = -1;
+	ret = IOT_MQTT_Unsubscribe(pclient, TOPIC_DATA);
+	if (ret < 0) {
+		EXAMPLE_TRACE("subscribe error");
+		return NULL;
+	}
 }
 
-// subscribe
-void CASE2(void *pclient)
-{
-    int   ret = -1;
 
-    if (pclient == NULL) {
-        EXAMPLE_TRACE("param error");
-        return;
-    }
-    int stack_used = 0;
-    hal_os_thread_param_t task_parms1 = {0};
-    task_parms1.stack_size = 4096;
-    task_parms1.name = "thread_subscribe1";
-    ret = HAL_ThreadCreate(&g_thread_sub_unsub_1, thread_subscribe1, (void *)pclient, &task_parms1, &stack_used);
-    if (ret != 0) {
-        EXAMPLE_TRACE("Thread created failed!\n");
-        return;
-    }
 
-    hal_os_thread_param_t task_parms2 = {0};
-    task_parms2.stack_size = 4096;
-    task_parms2.name = "thread_subscribe2";
-    ret = HAL_ThreadCreate(&g_thread_sub_unsub_2, thread_subscribe2, (void *)pclient, &task_parms2, &stack_used);
-    if (ret != 0) {
-        EXAMPLE_TRACE("Thread created failed!\n");
-        return;
-    }
-}
 
 void *thread_publish1(void *pclient)
 {
@@ -283,11 +336,6 @@ void CASE1(void *pclient)
         return;
     }
 
-    ret = IOT_MQTT_Subscribe(pclient, TOPIC_DATA, IOTX_MQTT_QOS1, _demo_message_arrive, NULL);
-    if (ret < 0) {
-        EXAMPLE_TRACE("subscribe error");
-        return;
-    }
     int stack_used = 0;
     hal_os_thread_param_t task_parms1 = {0};
     task_parms1.stack_size = 4096;
@@ -306,90 +354,6 @@ void CASE1(void *pclient)
         EXAMPLE_TRACE("Thread created failed!\n");
         return;
     }
-}
-
-// rrpc
-#define TOPIC_RRPC_REQ       "/sys/"PRODUCT_KEY"/"DEVICE_NAME"/rrpc/request/"
-#define TOPIC_RRPC_RSP       "/sys/"PRODUCT_KEY"/"DEVICE_NAME"/rrpc/response/"
-#define RRPC_MQTT_MSGLEN    (1024)
-#define MSG_ID_LEN_MAX      (64)
-#define TOPIC_LEN_MAX       (1024)
-
-void mqtt_rrpc_msg_arrive(void *pcontext, void *pclient, iotx_mqtt_event_msg_pt msg)
-{
-    iotx_mqtt_topic_info_pt     ptopic_info = (iotx_mqtt_topic_info_pt) msg->msg;
-    uintptr_t packet_id = (uintptr_t)msg->msg;
-    switch (msg->event_type) {
-
-
-        case IOTX_MQTT_EVENT_SUBCRIBE_SUCCESS:
-            EXAMPLE_TRACE("subscribe success, packet-id=%u", (unsigned int)packet_id);
-            break;
-
-        case IOTX_MQTT_EVENT_SUBCRIBE_TIMEOUT:
-            EXAMPLE_TRACE("subscribe wait ack timeout, packet-id=%u", (unsigned int)packet_id);
-            break;
-
-        case IOTX_MQTT_EVENT_SUBCRIBE_NACK:
-            EXAMPLE_TRACE("subscribe nack, packet-id=%u", (unsigned int)packet_id);
-            break;
-        case IOTX_MQTT_EVENT_PUBLISH_RECEIVED: {
-            iotx_mqtt_topic_info_t      topic_msg;
-            char                        msg_pub[RRPC_MQTT_MSGLEN] = {0};
-            char                        topic[TOPIC_LEN_MAX] = {0};
-            char                        msg_id[MSG_ID_LEN_MAX] = {0};
-
-            /* print topic name and topic message */
-            EXAMPLE_TRACE("----\n");
-            EXAMPLE_TRACE("Topic: '%.*s' (Length: %d)\n",
-                          ptopic_info->topic_len,
-                          ptopic_info->ptopic,
-                          ptopic_info->topic_len);
-            EXAMPLE_TRACE("Payload: '%.*s' (Length: %d)\n",
-                          ptopic_info->payload_len,
-                          ptopic_info->payload,
-                          ptopic_info->payload_len);
-            EXAMPLE_TRACE("----\n");
-
-     if (snprintf(msg_id,
-                         ptopic_info->topic_len - strlen(TOPIC_RRPC_REQ) + 1,
-                         "%s",
-                         ptopic_info->ptopic + strlen(TOPIC_RRPC_REQ))
-                > sizeof(msg_id)) {
-                EXAMPLE_TRACE("snprintf error!\n");
-                return;
-            }
-
-            EXAMPLE_TRACE("response msg_id = %s\n", msg_id);
-            if (snprintf(topic, sizeof(topic), "%s%s", TOPIC_RRPC_RSP, msg_id) > sizeof(topic)) {
-                EXAMPLE_TRACE("snprintf error!\n");
-                return;
-            }
-            EXAMPLE_TRACE("response topic = %s\n", topic);
-
-            sprintf(msg_pub, "rrpc client has received message!\n");
-            topic_msg.qos = IOTX_MQTT_QOS0;
-            topic_msg.retain = 0;
-            topic_msg.dup = 0;
-            topic_msg.payload = (void *)msg_pub;
-            topic_msg.payload_len = strlen(msg_pub);
-
-            if (IOT_MQTT_Publish(pclient, topic, &topic_msg) < 0) {
-                EXAMPLE_TRACE("error occur when publish!\n");
-            }
-        }
-        break;
-
-        case IOTX_MQTT_EVENT_BUFFER_OVERFLOW:
-            EXAMPLE_TRACE("buffer overflow, %s", msg->msg);
-            break;
-
-        default:
-            EXAMPLE_TRACE("Should NOT arrive here.");
-            break;
-
- }
-
 }
 
 // ota 经过测试， 程序启动时会对比，线上版本跟当前版本，版本不对会自动下载。
@@ -516,54 +480,12 @@ do_exit:
 
 int  thread_rrpc(void *pclient)
 {
-    int rc = 0;
-    /* Subscribe the specific topic */
-    rc = IOT_MQTT_Subscribe(pclient, TOPIC_RRPC_REQ "+", IOTX_MQTT_QOS0, mqtt_rrpc_msg_arrive, NULL);
-    if (rc < 0) {
-        IOT_MQTT_Destroy(&pclient);
-        EXAMPLE_TRACE("IOT_MQTT_Subscribe failed, rc = %d\n", rc);
-        return -1;
-    }
 
     ota_mqtt_loop( pclient );
 
 }
 
-void CASE3(void *pclient)
-{
-	int   ret = -1;
 
-	if (pclient == NULL) {
-		EXAMPLE_TRACE("param error");
-		return;
-	}
-
-	int stack_used = 0;
-	hal_os_thread_param_t task_parms1 = {0};
-	task_parms1.stack_size = 4096;
-	task_parms1.name = "thread_rrpc";
-	ret = HAL_ThreadCreate(&g_thread_rrpc, thread_rrpc, (void *)pclient, &task_parms1, &stack_used);
-	if (ret != 0) {
-		EXAMPLE_TRACE("Thread created failed!\n");
-		return;
-	}
-
-}
-
-
-
-
-// yield thread
-void *thread_yield(void *pclient)
-{
-    while (g_thread_yield_running) {
-        IOT_MQTT_Yield(pclient, 200);
-
-        HAL_SleepMs(200);
-    }
-
-    return NULL;
-}
 
 static uint64_t user_update_sec(void)
 {
@@ -578,28 +500,52 @@ static uint64_t user_update_sec(void)
     return (HAL_UptimeMs() - time_start_ms) / 1000;
 }
 
+int thread_subscribes()
+{
+	int   ret = -1;
+
+	if (pclient == NULL) {
+		EXAMPLE_TRACE("param error");
+		return;
+	}
+
+	int stack_used = 0;
+	hal_os_thread_param_t task_parms1 = {0};
+	task_parms1.stack_size = 4096;
+	task_parms1.name = "do_subscribes";
+	ret = HAL_ThreadCreate(&g_thread_do_subscribes, do_subscribes, (void *)pclient, &task_parms1, &stack_used);
+	if (ret != 0) {
+		EXAMPLE_TRACE("Thread created failed!\n");
+		return;
+	}
+}
+
+
+//关闭线程，以及 关闭mqtt连接
+void close_mqtt_client()
+{
+	HAL_ThreadDelete(g_thread_pub_1);
+	HAL_ThreadDelete(g_thread_pub_2);
+
+	if(g_thread_do_subscribes)
+	    HAL_ThreadDelete(g_thread_do_subscribes); //必须线程已经起来了，不然执行这个函数会出现程序崩溃
+
+	IOT_MQTT_Destroy(&pclient);
+}
+
+
 int mqtt_client(void *params)
 {
     int rc = 0;//, msg_len, cnt = 0;
-    void *pclient;
     iotx_conn_info_pt pconn_info;
     iotx_mqtt_param_t mqtt_params;
-    uint64_t max_running_seconds = 30;
 
-//#if defined(__UBUNTU_SDK_DEMO__)
-    int                             argc = ((app_main_paras_t *)params)->argc;
-    char                          **argv = ((app_main_paras_t *)params)->argv;
+//    int                             argc = ((app_main_paras_t *)params)->argc;
+//    char                          **argv = ((app_main_paras_t *)params)->argv;
 
-    if (argc > 1) {
-        int     tmp = atoi(argv[1]);
 
-        if (tmp >= 60) {
-            max_running_seconds = tmp;
-            EXAMPLE_TRACE("set [max_running_seconds] = %d seconds\n", max_running_seconds);
-        }
-    }
-//#endif
     /* Device AUTH */
+    /*在与服务器尝试建立MQTT连接前, 填入设备身份认证信息:*/
     if (0 != IOT_SetupConnInfo(PRODUCT_KEY, DEVICE_NAME, DEVICE_SECRET, (void **)&pconn_info)) {
         EXAMPLE_TRACE("AUTH request failed!");
         return -1;
@@ -632,68 +578,48 @@ int mqtt_client(void *params)
         return -1;
     }
 
-    EXAMPLE_TRACE("TEST CASE");
-    int stack_used = 0;
-
-    hal_os_thread_param_t task_parms = {0};
-    task_parms.stack_size = 6144;
-    task_parms.name = "thread_yield";
-    rc = HAL_ThreadCreate(&g_thread_yield, thread_yield, (void *)pclient, &task_parms, &stack_used);
-    if (rc != 0) {
-        goto do_exit;
-    }
-
-    // mutli thread publish
+    //先执行订阅操作，即向 iot中心 订阅主题，iot可以推送信息给当前设备。
+    //    do_subscribes( pclient ); //不用线程方式订阅
+    thread_subscribes();  //使用线程方式订阅，异步向一步操作，避免阻塞在此。
+   
+    // 推送信息给 iot 中心的线程，先注释掉
     //    CASE1(pclient);
 
-    // mutli thread subscribe
-    CASE2(pclient);
+    // 该循环用来监听以及订阅的主题（可以多个）的iot消息回复 
+    while (g_while_yield_running) {
+	    //阻塞并获取IoT回复的消息。200为 200ms阻塞时间
+	    IOT_MQTT_Yield(pclient, 200);
 
-    // mutli thread rrpc
-    CASE3(pclient);
-
-
-    while (1) {
-        if (user_update_sec() > max_running_seconds) {
-            break;
-        }
-        HAL_SleepMs(1000);
+	    //延迟200ms
+	    HAL_SleepMs(200);
     }
 
-    g_thread_sub_unsub_1_running = 0;
-    g_thread_sub_unsub_2_running = 0;
-    g_thread_pub_1_running = 0;
-    g_thread_pub_2_running = 0;
-    g_thread_yield_running = 0;
-    HAL_SleepMs(5000);
+    HAL_SleepMs(3000);
     
 do_exit:
-
-    HAL_ThreadDelete(g_thread_sub_unsub_1);
-    HAL_ThreadDelete(g_thread_sub_unsub_2);
-    HAL_ThreadDelete(g_thread_pub_1);
-    HAL_ThreadDelete(g_thread_pub_2);
-    HAL_ThreadDelete(g_thread_yield);
-    IOT_MQTT_Destroy(&pclient);
+    close_mqtt_client();
     return rc;
 }
 
 
 int linkkit_main(void *params)
 {
-    IOT_SetLogLevel(IOT_LOG_DEBUG);
-    /**< set device info*/
-    HAL_SetProductKey(PRODUCT_KEY);
-    HAL_SetDeviceName(DEVICE_NAME);
-    HAL_SetDeviceSecret(DEVICE_SECRET);
-    /**< end*/
-    mqtt_client(params);
-    IOT_DumpMemoryStats(IOT_LOG_DEBUG);
-    IOT_SetLogLevel(IOT_LOG_NONE);
+	//设置log 等级
+	IOT_SetLogLevel(IOT_LOG_DEBUG);
+	/**< set device info*/
 
-    EXAMPLE_TRACE("out of sample!");
+	HAL_SetProductKey(PRODUCT_KEY);
+	HAL_SetDeviceName(DEVICE_NAME);
+	HAL_SetDeviceSecret(DEVICE_SECRET);
 
-    return 0;
+	/**< end*/
+	mqtt_client(params);
+	IOT_DumpMemoryStats(IOT_LOG_DEBUG);
+	IOT_SetLogLevel(IOT_LOG_NONE);
+
+	EXAMPLE_TRACE("out of sample!");
+
+	return 0;
 }
 
 

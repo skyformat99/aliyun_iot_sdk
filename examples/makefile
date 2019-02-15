@@ -33,8 +33,8 @@ LIBS += -lpthread -lrt
 #SOURCE := $(foreach S,$(SOURCES),$(subst $(SOURCE_ROOT)/$(LINKKIT_MODULE),.,$(S)))
 #OBJS = $(patsubst %.c,%.o,$(SOURCE))  
 
-SRCS_funjsq_iot_client          := app_entry.c mqtt/mqtt_example_rrpc.c
-BIN_TARGET = ali_iot
+SRCS_funjsq_iot_client          := app_entry.c mqtt/mqtt_example_multithread.c
+BIN_TARGET = funjsq_iot
 
 all:
 	$(CC)  $(CFLAGS)  $(SRCS_funjsq_iot_client) -o ./../bin/$(BIN_TARGET)  $(INCLS) $(LIBS)
