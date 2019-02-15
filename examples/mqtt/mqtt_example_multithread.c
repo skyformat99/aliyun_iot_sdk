@@ -11,7 +11,7 @@
 #include "iot_export.h"
 #include "app_entry.h"
 
-
+//定义iot设备的三元组信息，产品KEY，设备名，设备密钥
 #define PRODUCT_KEY             "a1I03ZK7sas"
 #define DEVICE_NAME             "test"
 #define DEVICE_SECRET           "Sc59fsDoDAHgPVDn6jla7rhvO3kRodtn"
